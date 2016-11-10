@@ -1,5 +1,7 @@
+#include <argp.h>
 #include <elf.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -8,148 +10,231 @@
 #include <udis86.h>
 #include <unistd.h>
 
+const char *argp_program_version = "uses-sse2 0.1.0";
+const char *argp_program_bug_address = "<hauzer.nv@gmail.com>";
+
+struct args {
+    char **input;
+    bool quiet;
+};
+
+error_t handle_arg(int key, char *arg, struct argp_state *state) {
+    struct args *args = state->input;
+    switch(key) {
+        case 'q':
+            args->quiet = true;
+            break;
+        case ARGP_KEY_ARG:
+            args->input = realloc(args->input, sizeof(char*) * (state->arg_num + 2));
+            args->input[state->arg_num] = arg;
+            args->input[state->arg_num + 1] = NULL;
+            break;
+        case ARGP_KEY_END:
+            if(state->arg_num < 1) {
+                argp_usage(state);
+            }
+            break;
+        default:
+            return ARGP_ERR_UNKNOWN;
+    }
+
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    struct args args = {
+        .input = NULL,
+        .quiet = false,
+    };
+    {
+        const char *doc = "Examines ELF binaries for SSE2 instructions.\v";
+        const char *args_doc = "file [files...]";
+        struct argp_option opts[] = {
+            {"quiet",   'q', 0, 0, "Surpress all output and exit upon first match."},
+            { 0 }
+        };
+        struct argp argp = { opts, handle_arg, args_doc, doc };
+        argp_parse(&argp, argc, argv, 0, 0, &args);
+    }
+
     int exit_code = EXIT_FAILURE;
 
-    if(argc != 2) {
-        printf("usage: %s file\n\n", argv[0]);
-        goto cleanup_exit;
-    }
+    for(char **input = args.input; *input != NULL; ++input) {
+        bool do_exit = false;
 
-    int fd = open(argv[1], O_RDONLY);
-    if(fd == -1) {
-        printf("couldn't open file\n\n");
-        goto cleanup_exit;
-    }
+        if(!args.quiet) {
+            printf("Examining %s...\n", *input);
+        }
 
-    struct stat st;
-    if(fstat(fd, &st) != 0) {
-        printf("couldn't read file size\n\n");
-        goto cleanup_close;
-    }
+        int fd = open(*input, O_RDONLY);
+        if(fd == -1) {
+            if(!args.quiet) {
+                printf("  error: open()\n");
+            }
+            continue;
+        }
 
-    unsigned char *data = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-    if(data == MAP_FAILED) {
-        printf("couldn't map file into memory\n\n");
-        goto cleanup_close;
-    }
+        struct stat st;
+        {
+            int ret = fstat(fd, &st);
+            if(ret != 0) {
+                if(!args.quiet) {
+                    printf("  error: [%d] fstat()\n", ret);
+                }
+                goto cleanup_close;
+            }
+        }
 
-    if(data[EI_MAG0] != ELFMAG0 || data[EI_MAG1] != ELFMAG1 || data[EI_MAG2] != ELFMAG2 || data[EI_MAG3] != ELFMAG3) {
-        printf("not an ELF file\n\n");
-        goto cleanup_munmap;
-    }
+        unsigned char *data = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+        if(data == MAP_FAILED) {
+            if(!args.quiet) {
+                printf("  error: mmap() failed\n");
+            }
+            goto cleanup_close;
+        }
 
-    if(data[EI_CLASS] != ELFCLASS32) {
-        printf("not a 32-bit ELF\n\n");
-        goto cleanup_munmap;
-    }
-
-    {
-        uint16_t e_type = *(uint16_t*)&data[offsetof(Elf32_Ehdr, e_type)];
-        if(e_type != ET_EXEC && e_type != ET_DYN) {
-            printf("ELF is neither executable nor a dynamic library\n\n");
+        if(data[EI_MAG0] != ELFMAG0 || data[EI_MAG1] != ELFMAG1 || data[EI_MAG2] != ELFMAG2 || data[EI_MAG3] != ELFMAG3) {
+            if(!args.quiet) {
+                printf("  error: not an ELF file\n");
+            }
             goto cleanup_munmap;
         }
-    }
 
-    {
-        ud_t ud;
-        ud_init(&ud);
-        uint32_t e_shoff = *(uint32_t*)&data[offsetof(Elf32_Ehdr, e_shoff)];
-        uint16_t e_shentsize = *(uint16_t*)&data[offsetof(Elf32_Ehdr, e_shentsize)];
-        uint16_t e_shnum = *(uint16_t*)&data[offsetof(Elf32_Ehdr, e_shnum)];
-        for(unsigned char *section = &data[e_shoff + e_shentsize]; section != &data[e_shoff + e_shentsize * e_shnum]; section += e_shentsize) {
-            uint32_t sh_type = *(uint32_t*)&section[offsetof(Elf32_Shdr, sh_type)];
-            uint32_t sh_flags = *(uint32_t*)&section[offsetof(Elf32_Shdr, sh_flags)];
-            if(sh_type == SHT_PROGBITS && sh_flags & (SHF_ALLOC | SHF_EXECINSTR)) {
-                uint32_t sh_offset = *(uint32_t*)&section[offsetof(Elf32_Shdr, sh_offset)];
-                uint32_t sh_size = *(uint32_t*)&section[offsetof(Elf32_Shdr, sh_size)];
-                ud_set_input_buffer(&ud, &data[sh_offset], sh_size);
-                while(ud_disassemble(&ud)) {
-                    enum ud_mnemonic_code mnemonic = ud_insn_mnemonic(&ud);
-                    switch(mnemonic) {
-                        case UD_Iaddpd:
-                        case UD_Iaddsd:
-                        case UD_Isubpd:
-                        case UD_Imulpd:
-                        case UD_Imulsd:
-                        case UD_Idivpd:
-                        case UD_Idivsd:
-                        case UD_Imaxpd:
-                        case UD_Imaxsd:
-                        case UD_Iminpd:
-                        case UD_Iminsd:
-                        case UD_Ipaddq:
-                        case UD_Ipaddsw:
-                        case UD_Ipsubq:
-                        case UD_Ipsubusw:
-                        case UD_Ipmuludq:
-                        case UD_Isqrtpd:
-                        case UD_Isqrtsd:
-                        case UD_Iandnpd:
-                        case UD_Iandpd:
-                        case UD_Ipslldq:
-                        case UD_Ipsrldq:
-                        case UD_Iorpd:
-                        case UD_Ixorpd:
-                        case UD_Icmppd:
-                        case UD_Icmpsd:
-                        case UD_Icomisd:
-                        case UD_Iucomisd:
-                        case UD_Icvtdq2pd:
-                        case UD_Icvtdq2ps:
-                        case UD_Icvtpd2pi:
-                        case UD_Icvtpd2dq:
-                        case UD_Icvtpd2ps:
-                        case UD_Icvtpi2pd:
-                        case UD_Icvtps2dq:
-                        case UD_Icvtps2pd:
-                        case UD_Icvtsd2si:
-                        case UD_Icvtsd2ss:
-                        case UD_Icvtsi2sd:
-                        case UD_Icvtss2sd:
-                        case UD_Icvttpd2pi:
-                        case UD_Icvttpd2dq:
-                        case UD_Icvttps2dq:
-                        case UD_Icvttsd2si:
-                        case UD_Imovsd:
-                        case UD_Imovapd:
-                        case UD_Imovupd:
-                        case UD_Imovhpd:
-                        case UD_Imovlpd:
-                        case UD_Imovdq2q:
-                        case UD_Imovq2dq:
-                        case UD_Imovntpd:
-                        case UD_Imovnti:
-                        case UD_Imaskmovdqu:
-                        case UD_Ipmovmskb:
-                        case UD_Ipshufd:
-                        case UD_Ipshufhw:
-                        case UD_Ipshuflw:
-                        case UD_Iunpckhpd:
-                        case UD_Iunpcklpd:
-                        case UD_Ipunpckhqdq:
-                        case UD_Ipunpcklqdq:
-                        case UD_Iclflush:
-                        case UD_Ilfence:
-                        case UD_Imfence:
-                        case UD_Ipause:
-                            printf("found a SSE2 instruction\n\n");
-                            exit_code = EXIT_SUCCESS;
-                            goto cleanup_munmap;
-                        default: break;
+        if(data[EI_CLASS] != ELFCLASS32) {
+            if(!args.quiet) {
+                printf("  error: not a 32-bit ELF\n");
+            }
+            goto cleanup_munmap;
+        }
+
+        {
+            uint16_t e_type = *(uint16_t*)&data[offsetof(Elf32_Ehdr, e_type)];
+            if(e_type != ET_EXEC && e_type != ET_DYN) {
+                if(!args.quiet) {
+                    printf("  error: not an executable nor a dynamic library\n");
+                }
+                goto cleanup_munmap;
+            }
+        }
+
+        {
+            ud_t ud;
+            ud_init(&ud);
+            ud_set_mode(&ud, 32);
+            if(!args.quiet) {
+                ud_set_syntax(&ud, UD_SYN_INTEL);
+            }
+
+            uint32_t e_shoff = *(uint32_t*)&data[offsetof(Elf32_Ehdr, e_shoff)];
+            uint16_t e_shentsize = *(uint16_t*)&data[offsetof(Elf32_Ehdr, e_shentsize)];
+
+            uint16_t e_shstrndx = *(uint16_t*)&data[offsetof(Elf32_Ehdr, e_shstrndx)];
+            unsigned char *shstr = &data[e_shoff + e_shentsize * e_shstrndx];
+            uint32_t shstr_sh_offset = *(uint32_t*)&shstr[offsetof(Elf32_Shdr, sh_offset)];
+            unsigned char *sh_names = &data[shstr_sh_offset];
+
+            uint16_t e_shnum = *(uint16_t*)&data[offsetof(Elf32_Ehdr, e_shnum)];
+            for(unsigned char *section = &data[e_shoff + e_shentsize]; section != &data[e_shoff + e_shentsize * e_shnum]; section += e_shentsize) {
+                uint32_t sh_type = *(uint32_t*)&section[offsetof(Elf32_Shdr, sh_type)];
+                uint32_t sh_flags = *(uint32_t*)&section[offsetof(Elf32_Shdr, sh_flags)];
+                if(sh_type == SHT_PROGBITS && ((sh_flags & (SHF_ALLOC | SHF_EXECINSTR)) == (SHF_ALLOC | SHF_EXECINSTR))) {
+                    uint32_t sh_offset = *(uint32_t*)&section[offsetof(Elf32_Shdr, sh_offset)];
+                    uint32_t sh_size = *(uint32_t*)&section[offsetof(Elf32_Shdr, sh_size)];
+                    uint32_t sh_name = *(uint32_t*)&section[offsetof(Elf32_Shdr, sh_name)];
+
+                    ud_set_input_buffer(&ud, &data[sh_offset], sh_size);
+                    if(!args.quiet) {
+                        ud_set_pc(&ud, sh_offset);
+                    }
+
+                    while(ud_disassemble(&ud)) {
+                        switch(ud_insn_mnemonic(&ud)) {
+                            case UD_Iaddpd:
+                            case UD_Iaddsd:
+                            case UD_Iandnpd:
+                            case UD_Iandpd:
+                            case UD_Icmppd:
+                            case UD_Icmpsd:
+                            case UD_Icomisd:
+                            case UD_Icvtpi2pd:
+                            case UD_Icvtpd2pi:
+                            case UD_Icvtsi2sd:
+                            case UD_Icvtsd2si:
+                            case UD_Icvttpd2pi:
+                            case UD_Icvttsd2si:
+                            case UD_Icvtpd2ps:
+                            case UD_Icvtps2pd:
+                            case UD_Icvtsd2ss:
+                            case UD_Icvtss2sd:
+                            case UD_Icvtpd2dq:
+                            case UD_Icvttpd2dq:
+                            case UD_Icvtdq2pd:
+                            case UD_Icvtps2dq:
+                            case UD_Icvttps2dq:
+                            case UD_Icvtdq2ps:
+                            case UD_Idivpd:
+                            case UD_Idivsd:
+                            case UD_Imaxpd:
+                            case UD_Imaxsd:
+                            case UD_Iminpd:
+                            case UD_Iminsd:
+                            case UD_Imovapd:
+                            case UD_Imovhpd:
+                            case UD_Imovlpd:
+                            case UD_Imovmskpd:
+                            case UD_Imovsd: {
+                                /* Ignore the movsd string instruction, which has no operands.
+                                 * The SSE2 one always has two. */
+                                if(ud_insn_opr(&ud, 0) == NULL) {
+                                    continue;
+                                }
+                            }
+                            case UD_Imovupd:
+                            case UD_Imulpd:
+                            case UD_Imulsd:
+                            case UD_Iorpd:
+                            case UD_Ishufpd:
+                            case UD_Isqrtpd:
+                            case UD_Isqrtsd:
+                            case UD_Isubsd:
+                            case UD_Isubpd:
+                            case UD_Iucomisd:
+                            case UD_Iunpckhpd:
+                            case UD_Iunpcklpd:
+                            case UD_Ixorpd:
+                            case UD_Imaskmovdqu:
+                            case UD_Iclflush:
+                            case UD_Imovntpd:
+                            case UD_Imovntdq:
+                            case UD_Imovnti:
+                            case UD_Ipause:
+                            case UD_Ilfence:
+                            case UD_Imfence: {
+                                exit_code = EXIT_SUCCESS;
+                                if(!args.quiet) {
+                                    printf("  [%s] 0x%08llx  %-14s%s\n",
+                                        &sh_names[sh_name], ud_insn_off(&ud), ud_insn_hex(&ud), ud_insn_asm(&ud));
+                                } else {
+                                    do_exit = true;
+                                    goto cleanup_munmap;
+                                }
+                            }
+                            default: break;
+                        }
                     }
                 }
             }
         }
+
+    cleanup_munmap:
+        munmap(data, st.st_size);
+    cleanup_close:
+        close(fd);
+        if(do_exit) {
+            break;
+        }
     }
 
-printf("no SSE2 instructions found\n\n");
-
-cleanup_munmap:
-    munmap(data, st.st_size);
-cleanup_close:
-    close(fd);
-cleanup_exit:
+    free(args.input);
     exit(exit_code);
 }
