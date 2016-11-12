@@ -55,10 +55,10 @@ int main(int argc, char **argv) {
         } while(0)
 
     {
-        const char *doc = "Examines ELF binaries for SSE2 instructions.\v";
+        const char *doc = "Examine ELF binaries for SSE2 instructions.\v";
         const char *args_doc = "file [files...]";
         struct argp_option opts[] = {
-            {"quiet",   'q', 0, 0, "Surpress all output and exit upon first match."},
+            {"quiet",   'q', 0, 0, "Suppress all output and exit upon first match."},
             { 0 }
         };
         struct argp argp = { opts, handle_arg, args_doc, doc };
