@@ -46,6 +46,14 @@ int main(int argc, char **argv) {
         .input = NULL,
         .quiet = false,
     };
+
+    #define aprintf(...) \
+        do { \
+            if(!args.quiet) { \
+                printf(__VA_ARGS__); \
+            } \
+        } while(0)
+
     {
         const char *doc = "Examines ELF binaries for SSE2 instructions.\v";
         const char *args_doc = "file [files...]";
@@ -59,18 +67,21 @@ int main(int argc, char **argv) {
 
     int exit_code = EXIT_FAILURE;
 
+    ud_t ud;
+    ud_init(&ud);
+    ud_set_mode(&ud, 32);
+    if(!args.quiet) {
+        ud_set_syntax(&ud, UD_SYN_INTEL);
+    }
+
     for(char **input = args.input; *input != NULL; ++input) {
         bool do_exit = false;
 
-        if(!args.quiet) {
-            printf("Examining %s...\n", *input);
-        }
+        aprintf(">%s: ", *input);
 
         int fd = open(*input, O_RDONLY);
         if(fd == -1) {
-            if(!args.quiet) {
-                printf("  error: open()\n");
-            }
+            aprintf("error: open() failed\n");
             continue;
         }
 
@@ -78,60 +89,49 @@ int main(int argc, char **argv) {
         {
             int ret = fstat(fd, &st);
             if(ret != 0) {
-                if(!args.quiet) {
-                    printf("  error: [%d] fstat()\n", ret);
-                }
+                aprintf("error: [%d] fstat() failed\n", ret);
                 goto cleanup_close;
             }
         }
 
         unsigned char *data = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
         if(data == MAP_FAILED) {
-            if(!args.quiet) {
-                printf("  error: mmap() failed\n");
-            }
+            aprintf("error: mmap() failed\n");
             goto cleanup_close;
         }
 
         if(data[EI_MAG0] != ELFMAG0 || data[EI_MAG1] != ELFMAG1 || data[EI_MAG2] != ELFMAG2 || data[EI_MAG3] != ELFMAG3) {
-            if(!args.quiet) {
-                printf("  error: not an ELF file\n");
-            }
+            aprintf("error: not an ELF file\n");
             goto cleanup_munmap;
         }
 
         if(data[EI_CLASS] != ELFCLASS32) {
-            if(!args.quiet) {
-                printf("  error: not a 32-bit ELF\n");
-            }
+            aprintf("error: not a 32-bit ELF\n");
             goto cleanup_munmap;
         }
 
         {
             uint16_t e_type = *(uint16_t*)&data[offsetof(Elf32_Ehdr, e_type)];
             if(e_type != ET_EXEC && e_type != ET_DYN) {
-                if(!args.quiet) {
-                    printf("  error: not an executable nor a dynamic library\n");
-                }
+                aprintf("error: not an executable nor a dynamic library\n");
                 goto cleanup_munmap;
             }
         }
 
         {
-            ud_t ud;
-            ud_init(&ud);
-            ud_set_mode(&ud, 32);
-            if(!args.quiet) {
-                ud_set_syntax(&ud, UD_SYN_INTEL);
-            }
-
             uint32_t e_shoff = *(uint32_t*)&data[offsetof(Elf32_Ehdr, e_shoff)];
             uint16_t e_shentsize = *(uint16_t*)&data[offsetof(Elf32_Ehdr, e_shentsize)];
 
-            uint16_t e_shstrndx = *(uint16_t*)&data[offsetof(Elf32_Ehdr, e_shstrndx)];
-            unsigned char *shstr = &data[e_shoff + e_shentsize * e_shstrndx];
-            uint32_t shstr_sh_offset = *(uint32_t*)&shstr[offsetof(Elf32_Shdr, sh_offset)];
-            unsigned char *sh_names = &data[shstr_sh_offset];
+            uint16_t e_shstrndx;
+            unsigned char *shstr;
+            uint32_t shstr_sh_offset;
+            unsigned char *sh_names;
+            if(!args.quiet) {
+                e_shstrndx = *(uint16_t*)&data[offsetof(Elf32_Ehdr, e_shstrndx)];
+                shstr = &data[e_shoff + e_shentsize * e_shstrndx];
+                shstr_sh_offset = *(uint32_t*)&shstr[offsetof(Elf32_Shdr, sh_offset)];
+                sh_names = &data[shstr_sh_offset];
+            }
 
             uint16_t e_shnum = *(uint16_t*)&data[offsetof(Elf32_Ehdr, e_shnum)];
             for(unsigned char *section = &data[e_shoff + e_shentsize]; section != &data[e_shoff + e_shentsize * e_shnum]; section += e_shentsize) {
@@ -140,11 +140,16 @@ int main(int argc, char **argv) {
                 if(sh_type == SHT_PROGBITS && ((sh_flags & (SHF_ALLOC | SHF_EXECINSTR)) == (SHF_ALLOC | SHF_EXECINSTR))) {
                     uint32_t sh_offset = *(uint32_t*)&section[offsetof(Elf32_Shdr, sh_offset)];
                     uint32_t sh_size = *(uint32_t*)&section[offsetof(Elf32_Shdr, sh_size)];
-                    uint32_t sh_name = *(uint32_t*)&section[offsetof(Elf32_Shdr, sh_name)];
+                    uint32_t sh_name;
 
                     ud_set_input_buffer(&ud, &data[sh_offset], sh_size);
+
+                    bool did_print_newline;
+
                     if(!args.quiet) {
+                        sh_name = *(uint32_t*)&section[offsetof(Elf32_Shdr, sh_name)];
                         ud_set_pc(&ud, sh_offset);
+                        did_print_newline = false;
                     }
 
                     while(ud_disassemble(&ud)) {
@@ -183,8 +188,7 @@ int main(int argc, char **argv) {
                             case UD_Imovlpd:
                             case UD_Imovmskpd:
                             case UD_Imovsd: {
-                                /* Ignore the movsd string instruction, which has no operands.
-                                 * The SSE2 one always has two. */
+                                // We ignore the movsd string instruction.
                                 if(ud_insn_opr(&ud, 0) == NULL) {
                                     continue;
                                 }
@@ -207,11 +211,16 @@ int main(int argc, char **argv) {
                             case UD_Imovntpd:
                             case UD_Imovntdq:
                             case UD_Imovnti:
-                            case UD_Ipause:
+                            // This has the same bytecode as `ret rep`.
+                            // case UD_Ipause:
                             case UD_Ilfence:
                             case UD_Imfence: {
                                 exit_code = EXIT_SUCCESS;
                                 if(!args.quiet) {
+                                    if(!did_print_newline) {
+                                        printf("\n");
+                                        did_print_newline = true;
+                                    }
                                     printf("  [%s] 0x%08llx  %-14s%s\n",
                                         &sh_names[sh_name], ud_insn_off(&ud), ud_insn_hex(&ud), ud_insn_asm(&ud));
                                 } else {
