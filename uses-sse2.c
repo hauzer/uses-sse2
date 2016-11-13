@@ -118,22 +118,28 @@ int main(int argc, char **argv) {
             }
         }
 
+        bool uses_sse2;
         {
+            bool did_print_newline;
+
             uint32_t e_shoff = *(uint32_t*)&data[offsetof(Elf32_Ehdr, e_shoff)];
             uint16_t e_shentsize = *(uint16_t*)&data[offsetof(Elf32_Ehdr, e_shentsize)];
-
+            uint16_t e_shnum = *(uint16_t*)&data[offsetof(Elf32_Ehdr, e_shnum)];
             uint16_t e_shstrndx;
             unsigned char *shstr;
             uint32_t shstr_sh_offset;
             unsigned char *sh_names;
+
             if(!args.quiet) {
+                uses_sse2 = false;
+                did_print_newline = false;
+
                 e_shstrndx = *(uint16_t*)&data[offsetof(Elf32_Ehdr, e_shstrndx)];
                 shstr = &data[e_shoff + e_shentsize * e_shstrndx];
                 shstr_sh_offset = *(uint32_t*)&shstr[offsetof(Elf32_Shdr, sh_offset)];
                 sh_names = &data[shstr_sh_offset];
             }
 
-            uint16_t e_shnum = *(uint16_t*)&data[offsetof(Elf32_Ehdr, e_shnum)];
             for(unsigned char *section = &data[e_shoff + e_shentsize]; section != &data[e_shoff + e_shentsize * e_shnum]; section += e_shentsize) {
                 uint32_t sh_type = *(uint32_t*)&section[offsetof(Elf32_Shdr, sh_type)];
                 uint32_t sh_flags = *(uint32_t*)&section[offsetof(Elf32_Shdr, sh_flags)];
@@ -144,12 +150,10 @@ int main(int argc, char **argv) {
 
                     ud_set_input_buffer(&ud, &data[sh_offset], sh_size);
 
-                    bool did_print_newline;
 
                     if(!args.quiet) {
                         sh_name = *(uint32_t*)&section[offsetof(Elf32_Shdr, sh_name)];
                         ud_set_pc(&ud, sh_offset);
-                        did_print_newline = false;
                     }
 
                     while(ud_disassemble(&ud)) {
@@ -217,6 +221,7 @@ int main(int argc, char **argv) {
                             case UD_Imfence: {
                                 exit_code = EXIT_SUCCESS;
                                 if(!args.quiet) {
+                                    uses_sse2 = true;
                                     if(!did_print_newline) {
                                         printf("\n");
                                         did_print_newline = true;
@@ -239,8 +244,14 @@ int main(int argc, char **argv) {
         munmap(data, st.st_size);
     cleanup_close:
         close(fd);
-        if(do_exit) {
-            break;
+        if(!args.quiet) {
+            if(!uses_sse2) {
+                printf("ok\n");
+            }
+
+            if(do_exit) {
+                break;
+            }
         }
     }
 
